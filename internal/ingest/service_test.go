@@ -7,7 +7,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/convin/webhook-ingest/internal/store"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -82,6 +84,14 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
 	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 {
+		t.Fatalf("call_count=%d, want 1 after sequential redeliveries", got.CallCount)
+	}
 }
 
 func TestConcurrentDuplicateDeliveryIsIgnored(t *testing.T) {
@@ -131,4 +141,54 @@ func TestConcurrentDuplicateDeliveryIsIgnored(t *testing.T) {
 	if got.CallCount != 1 {
 		t.Fatalf("call_count=%d, want 1 (concurrent redeliveries must not double-count)", got.CallCount)
 	}
+}
+
+func TestRecordingIsMarkedProcessed(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	if !waitRecordingProcessed(t, st, callID, 2*time.Second) {
+		t.Fatal("recording was never marked processed (async work used the cancelled request context, and failures were swallowed)")
+	}
+}
+
+func TestUnprocessedRecordingIsRecoveredOnStart(t *testing.T) {
+	st := testutil.NewStore(t)
+	_, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	_, err := st.Pool().Exec(ctx, `
+		INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, recording_processed, updated_at)
+		VALUES ($1, $2, 'completed', 10, 'https://recordings.example.com/pending.wav', FALSE, now())`,
+		callID, accountID)
+	if err != nil {
+		t.Fatalf("insert call: %v", err)
+	}
+
+	_, _ = testutil.NewServer(t)
+
+	if !waitRecordingProcessed(t, st, callID, 2*time.Second) {
+		t.Fatal("unprocessed recording left behind after a crash/deploy was not picked up on start")
+	}
+}
+
+func waitRecordingProcessed(t *testing.T, st *store.Store, callID string, d time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	ctx := context.Background()
+	for time.Now().Before(deadline) {
+		var processed bool
+		err := st.Pool().QueryRow(ctx,
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, callID).Scan(&processed)
+		if err == nil && processed {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
 }
