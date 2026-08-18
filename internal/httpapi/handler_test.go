@@ -1,6 +1,8 @@
 package httpapi_test
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -83,5 +85,36 @@ func TestAccountStatsEndpointRespondsJSON(t *testing.T) {
 	}
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Fatalf("Content-Type is %q, want application/json", ct)
+	}
+}
+
+func TestAccountStatsComeFromDurableStore(t *testing.T) {
+	st := testutil.NewStore(t)
+	_, _, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	if err := st.IncrementAccountStats(ctx, accountID, 42); err != nil {
+		t.Fatalf("IncrementAccountStats: %v", err)
+	}
+
+	srv, _ := testutil.NewServer(t)
+	resp, err := http.Get(srv.URL + "/accounts/" + accountID + "/stats")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	var body struct {
+		CallCount        int64 `json:"call_count"`
+		TotalDurationSec int64 `json:"total_duration_sec"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.CallCount != 1 || body.TotalDurationSec != 42 {
+		t.Fatalf("got %+v, want call_count=1 total_duration_sec=42 (stats must survive a process restart)", body)
 	}
 }

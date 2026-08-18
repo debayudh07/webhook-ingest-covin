@@ -40,6 +40,7 @@ func main() {
 	defer func() { _ = rdb.Close() }()
 
 	svc := ingest.New(st, stats.NewCache(), rdb, log)
+	svc.Start()
 	srv := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.NewRouter(svc, log)}
 
 	go func() {
@@ -59,5 +60,8 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", "err", err)
+	}
+	if err := svc.Shutdown(shutdownCtx); err != nil {
+		log.Error("worker shutdown", "err", err)
 	}
 }
