@@ -4,6 +4,7 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -49,6 +50,13 @@ func New(ctx context.Context, dsn string, maxConns int32) (*Store, error) {
 		pool.Close()
 		return nil, err
 	}
+	// Applied by 002_unique_event_id.sql on a fresh volume; also ensure it
+	// exists here so tests against an already-initialized database get the
+	// uniqueness invariant without requiring `make reset`.
+	if _, err := pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS events_event_id_uidx ON events (event_id)`); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ensure event_id unique index: %w", err)
+	}
 	return &Store{pool: pool}, nil
 }
 
@@ -67,6 +75,56 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 		return false, nil
 	}
 	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// IngestCallEvent writes the event, the call row, and the stats increment in
+// one transaction. inserted is false when event_id already exists, in which
+// case nothing is written.
+func (s *Store) IngestCallEvent(ctx context.Context, e Event) (inserted bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	tag, err := tx.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		return false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, nil
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL); err != nil {
+		return false, err
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -128,4 +186,46 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 		return Stats{}, err
 	}
 	return st, nil
+}
+
+// AllAccountStats returns every durable aggregate, keyed by account_id.
+func (s *Store) AllAccountStats(ctx context.Context) (map[string]Stats, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT account_id, call_count, total_duration_sec FROM account_stats`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]Stats)
+	for rows.Next() {
+		var id string
+		var st Stats
+		if err := rows.Scan(&id, &st.CallCount, &st.TotalDurationSec); err != nil {
+			return nil, err
+		}
+		out[id] = st
+	}
+	return out, rows.Err()
+}
+
+// UnprocessedCallIDs lists calls that still need recording work.
+func (s *Store) UnprocessedCallIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT call_id FROM calls
+		 WHERE recording_url IS NOT NULL AND recording_url <> '' AND recording_processed = FALSE`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
