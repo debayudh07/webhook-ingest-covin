@@ -86,3 +86,35 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 		t.Fatal("expected recording_processed to be true")
 	}
 }
+
+func TestIngestCallEventIsIdempotent(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 15, Payload: []byte(`{}`),
+	}
+
+	for i := 0; i < 3; i++ {
+		inserted, err := s.IngestCallEvent(ctx, evt)
+		if err != nil {
+			t.Fatalf("IngestCallEvent %d: %v", i, err)
+		}
+		if i == 0 && !inserted {
+			t.Fatal("first ingest should insert")
+		}
+		if i > 0 && inserted {
+			t.Fatal("redelivery should not insert")
+		}
+	}
+
+	got, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 || got.TotalDurationSec != 15 {
+		t.Fatalf("got %+v, want CallCount=1 TotalDurationSec=15", got)
+	}
+}
